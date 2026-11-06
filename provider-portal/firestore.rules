@@ -1,0 +1,309 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function verifiedEmail() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+    function providerPath(providerId) {
+      return /databases/$(database)/documents/providers/$(providerId);
+    }
+    function technicianPath(providerId, technicianId) {
+      return /databases/$(database)/documents/providers/$(providerId)/technicians/$(technicianId);
+    }
+    function bookingPath(bookingId) {
+      return /databases/$(database)/documents/bookings/$(bookingId);
+    }
+    function role() {
+      return signedIn() && exists(userPath(request.auth.uid))
+        ? get(userPath(request.auth.uid)).data.get('role', '')
+        : '';
+    }
+    function isAdmin() {
+      return signedIn() && role() == 'admin';
+    }
+    function isCustomer() {
+      return signedIn() && role() == 'customer';
+    }
+    function isProvider(providerId) {
+      return signedIn() && request.auth.uid == providerId
+        && role() == 'provider';
+    }
+    function approvedProvider(providerId) {
+      return exists(providerPath(providerId)) &&
+        get(providerPath(providerId)).data.get('verificationStatus', '') == 'approved';
+    }
+    function isAssignedTechnician(data) {
+      return signedIn() && role() == 'technician'
+        && get(userPath(request.auth.uid)).data.get('providerId', '') == data.get('providerId', '')
+        && get(userPath(request.auth.uid)).data.get('technicianId', '') == data.get('technicianId', '')
+        && exists(technicianPath(data.get('providerId', ''), data.get('technicianId', '')))
+        && get(technicianPath(data.get('providerId', ''), data.get('technicianId', ''))).data.get('authUid', '') == request.auth.uid
+        && get(technicianPath(data.get('providerId', ''), data.get('technicianId', ''))).data.get('active', false) == true;
+    }
+    function bookingParty(data) {
+      return signedIn() && (
+        data.get('customerId', '') == request.auth.uid ||
+        isProvider(data.get('providerId', '')) ||
+        isAssignedTechnician(data) || isAdmin()
+      );
+    }
+    function onlyChanged(allowed) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowed);
+    }
+    function validTechnicianUserLink(uid, data) {
+      return verifiedEmail() && request.auth.uid == uid &&
+        data.get('role', '') == 'technician' &&
+        data.get('email', '') == request.auth.token.email &&
+        data.get('providerId', '') is string &&
+        data.get('technicianId', '') is string &&
+        getAfter(technicianPath(data.providerId, data.technicianId)).data.get('authUid', '') == uid &&
+        getAfter(technicianPath(data.providerId, data.technicianId)).data.get('workEmailNormalized', '') == request.auth.token.email &&
+        getAfter(technicianPath(data.providerId, data.technicianId)).data.get('accountStatus', '') == 'active';
+    }
+
+    // USER PROFILES — never allow self-assignment of admin/provider roles.
+    match /users/{uid} {
+      allow get: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow list: if isAdmin();
+
+      // Customer registration is client-created. Provider registration is
+      // initialized by trusted Cloud Functions (Admin SDK bypasses rules).
+      // Technician creation must be paired with invitation linking.
+      allow create: if isAdmin() || (
+        signedIn() && request.auth.uid == uid && (
+          (request.resource.data.get('role', '') == 'customer' &&
+           request.resource.data.get('email', '') == request.auth.token.email) ||
+          validTechnicianUserLink(uid, request.resource.data)
+        )
+      );
+      allow update: if isAdmin() || (
+        signedIn() && request.auth.uid == uid &&
+        onlyChanged(['displayName', 'phone', 'updatedAt'])
+      ) || (
+        signedIn() && request.auth.uid == uid &&
+        resource.data.get('role', '') == 'technician' &&
+        onlyChanged(['email','displayName','providerId','technicianId','updatedAt']) &&
+        validTechnicianUserLink(uid, request.resource.data) &&
+        request.resource.data.get('role','') == resource.data.get('role','')
+      );
+      allow delete: if isAdmin();
+    }
+
+    // PROVIDER COMPANY PROFILES — approved providers can appear in matching.
+    // REVIEW: sanitize public profile fields before real customer data.
+    match /providers/{providerId} {
+      allow get, list: if isAdmin() || isProvider(providerId) ||
+        (signedIn() && resource.data.get('verificationStatus', '') == 'approved');
+      // Approval and provider creation remain privileged backend actions.
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (
+        isProvider(providerId) &&
+        onlyChanged(['active','workingHours','serviceIds','updatedAt'])
+      );
+
+      match /branches/{branchId} {
+        allow read: if isAdmin() || isProvider(providerId) ||
+          (signedIn() && approvedProvider(providerId));
+        allow create, update, delete: if isAdmin() || isProvider(providerId);
+      }
+      match /serviceOfferings/{serviceId} {
+        allow read: if isAdmin() || isProvider(providerId) ||
+          (signedIn() && approvedProvider(providerId));
+        allow create, update, delete: if isAdmin() || isProvider(providerId);
+      }
+      match /technicians/{technicianId} {
+        // Customer appointment selection presently reads private technician
+        // documents; this read is intentionally NOT granted to customers.
+        // A sanitized public availability projection is required.
+        allow read: if isAdmin() || isProvider(providerId) ||
+          (signedIn() && resource.data.get('authUid','') == request.auth.uid);
+        allow create: if isAdmin() || (
+          isProvider(providerId) &&
+          request.resource.data.get('accountStatus','') == 'pending' &&
+          request.resource.data.get('authUid', null) == null &&
+          request.resource.data.get('workEmailNormalized','') ==
+            request.resource.data.get('workEmail','')
+        );
+        allow update: if isAdmin() || (
+          isProvider(providerId) &&
+          onlyChanged(['name','active','serviceIds','branchId','availabilityMode',
+                       'weeklyAvailability','phone','updatedAt'])
+        ) || (
+          verifiedEmail() &&
+          resource.data.get('workEmailNormalized','') == request.auth.token.email &&
+          (resource.data.get('authUid',null) == null ||
+           resource.data.get('authUid','') == request.auth.uid) &&
+          onlyChanged(['authUid','accountStatus','workEmailNormalized','updatedAt']) &&
+          request.resource.data.get('authUid','') == request.auth.uid &&
+          request.resource.data.get('accountStatus','') == 'active' &&
+          getAfter(userPath(request.auth.uid)).data.get('role','') == 'technician' &&
+          getAfter(userPath(request.auth.uid)).data.get('providerId','') == providerId &&
+          getAfter(userPath(request.auth.uid)).data.get('technicianId','') == technicianId
+        );
+        allow delete: if isAdmin() || isProvider(providerId);
+
+        match /availabilityOverrides/{dayId} {
+          allow read: if isAdmin() || isProvider(providerId) ||
+            (signedIn() && get(technicianPath(providerId, technicianId)).data.get('authUid','') == request.auth.uid);
+          allow create, update, delete: if isAdmin() || isProvider(providerId);
+        }
+      }
+    }
+
+    // Invitation lookup uses collectionGroup('technicians').where(
+    // 'workEmailNormalized', isEqualTo: verifiedEmail).
+    match /{parent=**}/technicians/{technicianId} {
+      allow get, list: if verifiedEmail() &&
+        resource.data.get('workEmailNormalized','') == request.auth.token.email;
+    }
+
+    // BOOKINGS — customer may create their own pending requests.
+    match /bookings/{bookingId} {
+      allow get, list: if bookingParty(resource.data);
+      allow create: if isCustomer() &&
+        request.resource.data.get('customerId','') == request.auth.uid &&
+        request.resource.data.get('status','') == 'pending' &&
+        request.resource.data.get('serviceIds',[]) is list &&
+        request.resource.data.serviceIds.size() > 0 &&
+        request.resource.data.get('providerId','') is string &&
+        approvedProvider(request.resource.data.providerId) &&
+        exists(technicianPath(request.resource.data.providerId,
+                              request.resource.data.get('technicianId',''))) &&
+        get(technicianPath(request.resource.data.providerId,
+                           request.resource.data.technicianId)).data.get('active',false) == true &&
+        get(technicianPath(request.resource.data.providerId,
+                           request.resource.data.technicianId)).data.get('serviceIds',[]).hasAll(request.resource.data.serviceIds) &&
+        request.resource.data.get('appointmentStart',null) is timestamp &&
+        request.resource.data.get('appointmentEnd',null) is timestamp &&
+        request.resource.data.appointmentEnd > request.resource.data.appointmentStart;
+
+      allow update: if isAdmin() || (
+        // Customer can cancel only pending requests; never edit saved problems.
+        isCustomer() && resource.data.get('customerId','') == request.auth.uid &&
+        resource.data.get('status','') == 'pending' &&
+        request.resource.data.get('status','') == 'cancelled' &&
+        request.resource.data.get('trackingActive',false) == false &&
+        onlyChanged(['status','trackingActive','updatedAt'])
+      ) || (
+        // Provider/technician workflow. No arbitrary booking-field changes.
+        (isProvider(resource.data.get('providerId','')) ||
+         isAssignedTechnician(resource.data)) &&
+        onlyChanged(['status','updatedAt','trackingActive',
+                     'providerCurrentLatitude','providerCurrentLongitude',
+                     'distanceKm','etaMinutes','locationUpdatedAt']) &&
+        (
+          (resource.data.status == 'pending' &&
+           ['accepted','rejected','expired','cancelled'].hasAny([request.resource.data.status])) ||
+          (resource.data.status == 'accepted' &&
+           ['onTheWay','cancelled'].hasAny([request.resource.data.status])) ||
+          (resource.data.status == 'onTheWay' &&
+           ['onTheWay','arrived'].hasAny([request.resource.data.status])) ||
+          (resource.data.status == 'arrived' && request.resource.data.status == 'inProgress') ||
+          (resource.data.status == 'inProgress' && request.resource.data.status == 'completed')
+        ) &&
+        (
+          request.resource.data.status != resource.data.status ||
+          resource.data.status == 'onTheWay'
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    // APPOINTMENT RESERVATIONS — created with booking transaction.
+    match /slotReservations/{slotId} {
+      // Current appointment UI may fetch slots directly. This is a limited
+      // compatibility grant and exposes reservation metadata; audit later.
+      allow get: if signedIn();
+      allow list: if isAdmin();
+      allow create: if isCustomer() &&
+        request.resource.data.get('bookingId','') is string &&
+        getAfter(bookingPath(request.resource.data.bookingId)).data.get('customerId','') == request.auth.uid &&
+        getAfter(bookingPath(request.resource.data.bookingId)).data.get('status','') == 'pending' &&
+        request.resource.data.get('providerId','') ==
+          getAfter(bookingPath(request.resource.data.bookingId)).data.get('providerId','') &&
+        request.resource.data.get('technicianId','') ==
+          getAfter(bookingPath(request.resource.data.bookingId)).data.get('technicianId','') &&
+        request.resource.data.get('slotStart',null) is timestamp &&
+        request.resource.data.slotStart >=
+          getAfter(bookingPath(request.resource.data.bookingId)).data.appointmentStart &&
+        request.resource.data.slotStart <
+          getAfter(bookingPath(request.resource.data.bookingId)).data.appointmentEnd;
+      allow update: if false;
+      // Requires cancellation/rejection/expiry + release in SAME transaction.
+      allow delete: if isAdmin() || (
+        signedIn() &&
+        getAfter(bookingPath(resource.data.get('bookingId',''))).data.get('status','')
+          in ['cancelled','rejected','expired'] &&
+        bookingParty(getAfter(bookingPath(resource.data.get('bookingId',''))).data)
+      );
+    }
+
+    // NOTIFICATIONS — own inbox only; create requires a related booking.
+    // Still needs review against NotificationService field names and senders.
+    match /notifications/{notificationId} {
+      allow get, list: if isAdmin() ||
+        (signedIn() && resource.data.get('userId','') == request.auth.uid);
+      allow create: if signedIn() &&
+        request.resource.data.get('bookingId','') is string &&
+        exists(bookingPath(request.resource.data.bookingId)) &&
+        bookingParty(get(bookingPath(request.resource.data.bookingId)).data) &&
+        request.resource.data.get('userId','') in [
+          get(bookingPath(request.resource.data.bookingId)).data.get('customerId',''),
+          get(bookingPath(request.resource.data.bookingId)).data.get('providerId','')
+        ];
+      allow update: if isAdmin() ||
+        (signedIn() && resource.data.get('userId','') == request.auth.uid &&
+         onlyChanged(['read','isRead','updatedAt']));
+      allow delete: if isAdmin();
+    }
+
+    // REVIEWS and REPORTS — require customer ownership of referenced booking.
+    match /reviews/{reviewId} {
+      allow read: if signedIn();
+      allow create: if isCustomer() &&
+        exists(bookingPath(reviewId)) &&
+        get(bookingPath(reviewId)).data.get('customerId','') == request.auth.uid &&
+        get(bookingPath(reviewId)).data.get('status','') == 'completed' &&
+        request.resource.data.get('providerId','') ==
+          get(bookingPath(reviewId)).data.get('providerId','');
+      allow update, delete: if isAdmin();
+    }
+    match /reports/{reportId} {
+      allow get, list: if isAdmin() ||
+        (signedIn() && resource.data.get('reporterId','') == request.auth.uid);
+      allow create: if signedIn() &&
+        request.resource.data.get('reporterId','') == request.auth.uid &&
+        request.resource.data.get('bookingId','') is string &&
+        exists(bookingPath(request.resource.data.bookingId)) &&
+        get(bookingPath(request.resource.data.bookingId)).data.get('customerId','') == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Public service catalogue reads; only admin modifies catalogue.
+    match /categories/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /services/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /serviceCategories/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /serviceItems/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Everything else denied by default. Do NOT restore a catch-all allow.
+  }
+}

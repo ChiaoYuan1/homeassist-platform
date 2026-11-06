@@ -43,3 +43,48 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+
+# ==========================================
+# HomeAssist - Mobile App & Provider Portal
+# ==========================================
+
+# Node.js dependencies
+**/node_modules/
+
+# Generated Flutter and build files
+**/.dart_tool/
+**/build/
+**/.flutter-plugins-dependencies
+
+# Firebase cache
+**/.firebase/
+
+# Private environment files and API secrets
+**/.env
+**/.env.*
+!**/.env.example
+**/.dev.vars
+**/.dev.vars.*
+
+# Android local settings and signing keys
+**/local.properties
+**/key.properties
+**/*.jks
+**/*.keystore
+
+# Private Firebase service account files
+**/serviceAccountKey.json
+**/*-firebase-adminsdk-*.json
+
+# Debug logs
+**/firebase-debug.log*
+**/firestore-debug.log*
+**/npm-debug.log*
+**/yarn-debug.log*
+
+# Android generated build folders
+**/android/app/debug/
+**/android/app/profile/
+**/android/app/release/
+
