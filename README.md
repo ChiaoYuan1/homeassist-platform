@@ -1,4 +1,4 @@
-# house_service_app
+# HomeAssist Platform
 
 A new Flutter project.
 
